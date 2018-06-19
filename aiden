@@ -1,0 +1,276 @@
+#!/bin/bash
+
+: '
+Aiden offers a boilerplate to start and stop services.
+It also offer a basic watchdog which allow to restart the service if it fails
+
+When you start the service it launch the service and make a pidfile under PIDFILE_LOCATION
+By default, it prevents the same user to launch the same service
+but you can easily modify this behavior by modifiying the variable PIDFILE_LOCATION
+
+You need to implement at least 2 functions:
+  - [service_name]_start : contains your command, must return the pid
+  - [service_name]_clean : if your application needs to do some cleanup. If not just put `exit 0`
+
+NOTE: I am a beginner in bash, so if you think something can be improved do not hesitate to tell me
+'
+
+# script variables
+SERVICE='myservice'
+SCRIPT_NAME=${0}
+PIDFILE_LOCATION="/tmp/${SERVICE}/${UID}" # You're free to change this to accomodate your needs
+PIDFILE="${PIDFILE_LOCATION}/${SERVICE}.pid"
+WATCHDOG_PIDFILE="${PIDFILE_LOCATION}/${SERVICE}_watchdog.pid"
+WATCHDOG_SLEEP=5  # in seconds
+
+
+: '
+  Modify this function to start your service
+  But do not forget to return the PID!
+'
+myservice_start()
+{
+  echo ${SERVICE} > ${SERVICE}.tmp
+  tail -f ${SERVICE}.tmp > /dev/null &
+  pid=$!
+  echo ${pid}
+}
+
+
+: '
+  If your script need to do some "clean-up" use this function
+'
+myservice_clean()
+{
+  rm ${SERVICE}.tmp
+}
+
+
+create_pid_file()
+{
+  local PID=${1}
+  if [ ! -d ${PIDFILE_LOCATION} ]; then
+    mkdir -p ${PIDFILE_LOCATION}
+  fi
+}
+
+
+service_start()
+{
+  if [ -f ${PIDFILE} ]; then
+    >&2 echo "PIDFILE already exists at ${PIDFILE}. Is it already running?"
+    exit 1
+  fi
+
+  local with_watchdog=false
+
+  while [ 1 ]; do
+
+    case $1 in
+      --with-watchdog)
+        shift
+        with_watchdog=true
+      ;;
+
+      --service=)
+        SERVICE=${1##*=}
+        shift
+      ;;
+
+      --)
+        shift
+        break
+      ;;
+
+      *)
+        break
+      ;;
+
+    esac
+  done
+
+  # used for the watchdog
+  local service_args=$@
+
+  echo "Starting ${SERVICE}"
+  PID=`${SERVICE}_start ${service_args}`
+  if [ ${?} = 1 ]; then
+    >&2 echo "Failed to start service ${SERVICE}"
+    exit 1
+  fi
+
+  if [ -z ${PID} ]; then
+    >&2 echo "I do not have a PID. Did you forget to return it from the start_service function?"
+    exit 1
+  fi
+
+  echo Service started under PID:${PID}
+  create_pid_file ${PID}
+
+  if ${with_watchdog}; then
+    echo "Starting watchdog for service ${SERVICE}"
+    watchdog $service_args> /dev/null &
+    WATCHDOG_PID=${!}
+    echo "Watchdog started under PID: ${WATCHDOG_PID}"
+  fi
+}
+
+
+service_stop()
+{
+  if [ -f ${PIDFILE} ]; then
+    >&2 echo "'tis not running"
+    exit 1
+  fi
+
+  echo "Stopping ${SERVICE}"
+
+  if [ -f ${WATCHDOG_PIDFILE} ]; then
+    echo "The Watchdog was run${WATCHDOG_PID}"
+    rm ${WATCHDOG_PIDFILE}
+  fi
+
+  cat ${PIDFILE} | xargs kill
+  rm ${PIDFILE}
+  ${SERVICE}_clean
+  echo "${SERVICE} stopped"
+}
+
+
+# deactivated
+service_update()
+{
+  exit 0
+  local version=''
+  if is_in_virtual_env ; then
+
+    while [[ ${#} -gt 0 ]]; do
+      case $1 in
+        -v)
+          shift
+          version=${1}
+        ;;
+        --version=*)
+          version=${1##*=}
+        ;;
+      esac
+      shift
+    done
+
+    if [ -z version ] ; then
+      echo "You need to provide a version with the -v or --version= flag"
+    fi
+
+  else
+    echo "Need to be in a VIRTUALENV to update the service ${SERVICE}"
+  fi
+}
+
+
+# deactivated
+service_rename()
+{
+  exit 0
+  local tmp_file="${0}.tmp"
+  local new_service=$1
+  shift
+
+  if [ -z ${new_service} ]; then
+    >&2 echo 'I need the new name of the service'
+    exit 1
+  elif [ ${new_service} == 'service' ]]; then
+    >&2 echo 'There is no way i can let you do this'
+    exit 1
+  fi
+
+  sed -i "s/${SERVICE}/$new_service/g" ${tmp_file}
+  mv ${tmp_file} ${SCRIPT_NAME}
+  exit 0
+}
+
+
+service_help()
+{
+  local which_help=$1
+
+  echo "---------=== ${SERVICE} ===---------"
+
+  if [ -z ${which_help}] || [ $which_help -eq 'start']; then
+    echo '-- start : start your service. You can add the arguments below'
+    echo '  -- Options [--with-watchdog] [-- [service_args]]'
+    echo "    --with-watchdog : run a subprocess to monitor the service and restart it an't is not running anymore"
+    echo "    service_args :  custom commands from your service (OPTIONAL: You can use -- to separate aiden args from yours)"
+  fi
+  if [ -z ${which_help}] || [ $which_help -eq 'stop']; then
+    echo '-- stop'
+  fi
+  if [ -z ${which_help}] || [ $which_help -eq 'update']; then
+    echo ''
+  fi
+}
+
+
+: '
+  The main of your service
+  There are only start and stop right now
+  but if you need more... you will have to add them
+'
+service_main()
+{
+  cmd=${1:-}
+  shift
+
+  case ${cmd} in
+
+    start)
+      service_start $@
+    ;;
+
+    stop)
+      service_stop $@
+    ;;
+
+    help)
+      service_help $@
+    ;;
+
+    *)
+      echo 'I have no idea of what you are talking about. Try to read this'
+      service_help
+    ;;
+  esac
+
+}
+
+
+service_is_alive()
+{
+  local service_pid=`cat ${PIDFILE}`
+  local process=`ps ${service_pid} | grep ${service_pid} | awk '{print $1}'`
+
+  if [ -z ${process} ]; then
+    return 1
+  else
+    return 0
+  fi
+}
+
+
+watchdog()
+{
+  local start_args=${@}
+
+  while [ -f ${WATCHDOG_PIDFILE} ] ; do
+    if ! service_is_alive; then
+
+      # process has crashed, so the pidfile still exists
+      rm ${PIDFILE}
+      service_start ${start_args}
+    fi
+    sleep ${WATCHDOG_SLEEP}
+  done
+
+  exit 0
+}
+
+service_main $@
